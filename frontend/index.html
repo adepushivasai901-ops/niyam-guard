@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>NiyamGuard AI - Citizen Assistant</title>
+<style>
+  :root {
+    --gov-blue: #0b3d66;
+    --gov-blue-light: #14548a;
+    --accent: #d97706;
+    --bg: #f3f5f7;
+    --bubble-user: #0b3d66;
+    --bubble-bot: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: 'Segoe UI', Arial, sans-serif;
+    background: var(--bg); display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    background: var(--gov-blue); color: white; padding: 14px 20px;
+    display: flex; align-items: center; gap: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+  }
+  header .emblem { width: 34px; height: 34px; border-radius: 50%; background: var(--accent);
+    display: flex; align-items: center; justify-content: center; font-weight: bold; }
+  header h1 { font-size: 17px; margin: 0; }
+  header p { font-size: 12px; margin: 0; opacity: 0.85; }
+
+  #profile-bar {
+    background: #eef3f8; padding: 8px 16px; font-size: 12px; color: #333;
+    display: flex; gap: 10px; flex-wrap: wrap; align-items: center; border-bottom: 1px solid #dbe3ec;
+  }
+  #profile-bar input, #profile-bar select {
+    font-size: 12px; padding: 4px 6px; border: 1px solid #c6d0da; border-radius: 4px; width: 90px;
+  }
+
+  #chat { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 10px; line-height: 1.45; font-size: 14.5px; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--bubble-user); color: white; border-bottom-right-radius: 2px; }
+  .msg.bot { align-self: flex-start; background: var(--bubble-bot); color: #1b1b1b; border: 1px solid #dfe4ea; border-bottom-left-radius: 2px; }
+  .meta { font-size: 10.5px; color: #8a95a1; margin-top: 3px; }
+
+  #input-bar { display: flex; padding: 14px; background: white; border-top: 1px solid #dfe4ea; gap: 8px; }
+  #input-bar input { flex: 1; padding: 12px 14px; border: 1px solid #c6d0da; border-radius: 8px; font-size: 14px; }
+  #input-bar button { background: var(--gov-blue); color: white; border: none; padding: 0 20px; border-radius: 8px; cursor: pointer; font-size: 14px; }
+  #input-bar button:hover { background: var(--gov-blue-light); }
+
+  #suggestions { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 20px 10px; }
+  #suggestions button { font-size: 12px; background: white; border: 1px solid #c6d0da; padding: 6px 10px; border-radius: 14px; cursor: pointer; }
+  #suggestions button:hover { background: #eef3f8; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="emblem">NG</div>
+  <div>
+    <h1>NiyamGuard AI - Citizen Assistant</h1>
+    <p>Verified government scheme &amp; circular information</p>
+  </div>
+</header>
+
+<div id="profile-bar">
+  <span>Your profile (used only for eligibility checks):</span>
+  <input type="number" id="p-age" placeholder="Age" />
+  <input type="number" id="p-income" placeholder="Annual income" />
+  <select id="p-category">
+    <option value="">Category</option>
+    <option>SC</option><option>ST</option><option>OBC</option><option>General-EWS</option><option>General</option>
+  </select>
+  <label style="font-size:12px;"><input type="checkbox" id="p-enrolled" /> Currently enrolled in a course</label>
+</div>
+
+<div id="suggestions">
+  <button onclick="quick('Show me the income certificate circular')">Show income certificate circular</button>
+  <button onclick="quick('What changed between the old and new income certificate rule?')">Compare old vs new income certificate rule</button>
+  <button onclick="quick('What documents are required for post-matric scholarship?')">Documents for scholarship</button>
+  <button onclick="quick('Am I eligible for post-matric scholarship?')">Am I eligible for scholarship?</button>
+  <button onclick="quick('What is the process for old-age pension?')">Process for pension</button>
+  <button onclick="quick('Compare post-matric scholarship and old-age pension')">Compare scholarship vs pension</button>
+</div>
+
+<div id="chat"></div>
+
+<div id="input-bar">
+  <input id="msg" type="text" placeholder="Ask about a scheme, circular, eligibility, or process..." onkeydown="if(event.key==='Enter') send()" />
+  <button onclick="send()">Send</button>
+</div>
+
+<script>
+const API_BASE = "http://localhost:8000";
+let sessionId = null;
+
+function addMsg(text, who, meta) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ' + who;
+  div.textContent = text;
+  if (meta) {
+    const m = document.createElement('div');
+    m.className = 'meta';
+    m.textContent = meta;
+    div.appendChild(m);
+  }
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function getProfile() {
+  const age = document.getElementById('p-age').value;
+  const income = document.getElementById('p-income').value;
+  const category = document.getElementById('p-category').value;
+  const enrolled = document.getElementById('p-enrolled').checked;
+  const profile = {};
+  if (age) profile.age = parseInt(age);
+  if (income) profile.annual_income = parseFloat(income);
+  if (category) profile.category = category;
+  profile.currently_enrolled = enrolled;
+  return profile;
+}
+
+function quick(text) {
+  document.getElementById('msg').value = text;
+  send();
+}
+
+async function send() {
+  const input = document.getElementById('msg');
+  const text = input.value.trim();
+  if (!text) return;
+  addMsg(text, 'user');
+  input.value = '';
+
+  try {
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, message: text, user_profile: getProfile() })
+    });
+    const data = await res.json();
+    sessionId = data.session_id;
+    addMsg(data.reply, 'bot', `intent: ${data.intent}`);
+  } catch (e) {
+    addMsg('Could not reach the NiyamGuard AI backend. Make sure the FastAPI server is running on ' + API_BASE, 'bot');
+  }
+}
+
+addMsg("Namaste. I am the NiyamGuard AI citizen assistant. I can share circulars, check scheme eligibility, list required documents, explain application processes, and compare schemes - all from verified government records. How may I help you today?", 'bot');
+</script>
+
+</body>
+</html>
