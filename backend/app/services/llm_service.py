@@ -52,6 +52,13 @@ def _call_ollama(prompt: str, system: Optional[str] = None, max_tokens: int = 10
         return None
 
 
+def call_raw(prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> Optional[str]:
+    """Public entry point for other modules (e.g. profile_extraction) that
+    need a raw LLM call without going through classify_intent/format_reply.
+    Returns None on any failure - callers must handle that gracefully."""
+    return _call_ollama(prompt, max_tokens=max_tokens, temperature=temperature)
+
+
 SYSTEM_PROMPT = """You are NiyamGuard AI, an official government policy compliance and citizen assistance
 assistant. You speak the way a well-trained, professional government employee would:
 clear, precise, respectful, and neutral - never casual, never speculative.
@@ -76,6 +83,17 @@ STRICT RULES:
   number of copies required for each and any notes present.
 - If structured data has a "required_fields" list (missing profile info), ask for exactly
   those fields by name - do not ask vaguely for "more information".
+- If the intent is "recommend_schemes", structured data has "eligible_schemes" and
+  "not_eligible_schemes" lists - present the eligible ones first with a brief reason each,
+  and mention not-eligible ones only briefly if the citizen might want to know why.
+- If the intent is "guided_step", structured data has a single "guided_step" with title/
+  description/required_documents, plus "total_steps" and whether it "is_last_step". Present
+  ONLY that one step, encourage the citizen to say "next" when ready to continue, and if
+  is_last_step is true, note this is the final step.
+- If the intent is "explain_legal", structured data has "circular_raw_text" - the ACTUAL
+  verified text of the circular. For this intent ONLY, you may paraphrase and simplify that
+  text into plain, everyday language explaining what it means - but you must not add any
+  fact, number, or requirement that isn't present in that text.
 - Keep tone formal and helpful, similar to how a knowledgeable government helpdesk officer
   would explain a rule to a citizen.
 """
@@ -205,6 +223,34 @@ def _template_fallback_reply(intent: str, data: Optional[dict]) -> str:
                           + "; ".join(f"{c['field']} changed from {c['old_value']} to {c['new_value']}" for c in rc.get("changes", [])))
 
         return "\n".join(lines)
+
+    if intent == "recommend_schemes" and isinstance(data, dict) and "eligible_schemes" in data:
+        lines = []
+        if data["eligible_schemes"]:
+            lines.append("Based on your profile, you appear eligible for:")
+            for s in data["eligible_schemes"]:
+                lines.append(f"  - {s['scheme_name']}" + (f" (benefit: {s['benefit_amount']})" if s.get("benefit_amount") else ""))
+        else:
+            lines.append("Based on your profile, no schemes matched all eligibility criteria.")
+        if data["not_eligible_schemes"]:
+            lines.append("Not currently eligible for: " + ", ".join(s["scheme_name"] for s in data["not_eligible_schemes"]))
+        return "\n".join(lines)
+
+    if intent == "guided_step" and isinstance(data, dict) and "guided_step" in data:
+        step = data.get("guided_step")
+        if step is None:
+            return data.get("message", "The process is complete.")
+        lines = [f"{data['scheme_name']} - Step {step['step_number']} of {data.get('total_steps', '?')}: {step['title']}",
+                 step["description"]]
+        if step.get("required_documents"):
+            lines.append("Documents needed for this step: " + ", ".join(step["required_documents"]))
+        lines.append("Final step." if data.get("is_last_step") else "Say 'next' when you're ready to continue.")
+        return "\n".join(lines)
+
+    if intent == "explain_legal" and isinstance(data, dict) and "circular_raw_text" in data:
+        return (f"Here is the verbatim text from {data.get('circular')}:\n\n{data['circular_raw_text']}\n\n"
+                f"(Plain-language explanation requires the local LLM to be running - "
+                f"start Ollama to get a simplified explanation instead of the raw text.)")
 
     if intent == "fetch_document":
         if isinstance(data, list):

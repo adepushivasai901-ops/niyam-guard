@@ -23,6 +23,10 @@ OPERATORS = {
     ">=": lambda a, b: a is not None and a >= b,
     "in": lambda a, b: a in b,
     "not_in": lambda a, b: a not in b,
+    # user_value is a LIST (e.g. citizen_categories); rule.value is a single
+    # tag that must appear in it - e.g. field="citizen_categories",
+    # operator="contains", value="ex_serviceman".
+    "contains": lambda a, b: isinstance(a, (list, tuple, set)) and b in a,
 }
 
 
@@ -67,6 +71,8 @@ def evaluate_rule(rule: models.EligibilityRule, profile: Dict[str, Any]) -> tupl
                 explanation += f" - your provided value ({user_value:,.0f}) is short of this by {gap:,.0f}"
     elif rule.operator == "in" and user_value is not None:
         explanation += f" - your provided value was '{user_value}', which is not in the allowed list"
+    elif rule.operator == "contains":
+        explanation += " - this scheme requires belonging to a specific citizen category that wasn't indicated"
     elif user_value is None:
         explanation += " - this could not be verified because the value was not provided"
 

@@ -64,6 +64,11 @@ class Scheme(Base):
     category = Column(String(100), nullable=True)             # e.g. "certificate", "scholarship", "pension"
     department_id = Column(Integer, ForeignKey("departments.id"))
     short_description = Column(Text, nullable=True)
+    # Which citizen groups this scheme targets - e.g. ["student","sc","st"] or
+    # ["farmer"] or ["general"]. Used to narrow candidate schemes BEFORE running
+    # the eligibility engine, instead of evaluating every scheme against every
+    # query. See handlers/scheme_finder.py.
+    target_categories = Column(JSON, nullable=True)
 
     department = relationship("Department", back_populates="schemes")
     versions = relationship("SchemeVersion", back_populates="scheme", order_by="SchemeVersion.id")
@@ -159,6 +164,13 @@ class ChatSession(Base):
 
     id = Column(String(64), primary_key=True)   # client-generated session id (e.g. uuid4)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Conversational memory: lets follow-up questions ("what documents does
+    # it need?") resolve without repeating the scheme name every time, and
+    # lets a guided step-by-step walkthrough remember where the citizen is.
+    last_scheme_slug = Column(String(300), nullable=True)
+    guided_scheme_slug = Column(String(300), nullable=True)
+    guided_process_step = Column(Integer, nullable=True)  # None = no active walkthrough
 
     messages = relationship("ChatMessage", back_populates="session", order_by="ChatMessage.id")
 

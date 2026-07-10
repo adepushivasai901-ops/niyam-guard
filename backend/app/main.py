@@ -50,7 +50,7 @@ def chat(req: schemas.ChatRequest, db: Session = Depends(get_db)):
 
     history = [{"role": m.role, "content": m.content} for m in session.messages]
 
-    intent, reply, data = orchestrator.handle_message(db, req.message, req.user_profile, history)
+    intent, reply, data = orchestrator.handle_message(db, req.message, req.user_profile, history, session)
 
     db.add(models.ChatMessage(session_id=session_id, role="user", content=req.message, intent=intent))
     db.add(models.ChatMessage(session_id=session_id, role="assistant", content=reply, intent=intent))
