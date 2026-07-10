@@ -1,27 +1,43 @@
-# Python cache
-__pycache__/
+Python cache
+
+pycache/
 *.py[cod]
 *.pyo
+*.pyd
 
-# Virtual environments
+Virtual environments
+
 venv/
+env/
+.env/
 
-# Environment variables
+Environment variables
+
 .env
+.env.local
 
-# SQLite databases
+SQLite databases
+
 *.db
+*.sqlite3
 
-# VS Code settings
+IDEs and Editors
+
 .vscode/
+.idea/
+*.swp
 
-# Logs
+Logs
+
 *.log
 
-# Build artifacts
+Build artifacts
+
 build/
 dist/
+*.egg-info/
 
-# macOS / Windows
+macOS / Windows
+
 .DS_Store
 Thumbs.db
