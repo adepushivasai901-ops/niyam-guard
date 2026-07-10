@@ -16,6 +16,7 @@ This is what makes "compare old vs new circular" a plain data diff instead of
 an LLM re-reading two PDFs and hoping it notices the difference.
 """
 from datetime import datetime
+import uuid
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean, Text, DateTime, ForeignKey, JSON
 )
@@ -110,9 +111,7 @@ class SchemeVersion(Base):
 
 
 class EligibilityRule(Base):
-    """A single, structured, evaluable eligibility condition.
-    field/operator/value is deliberately simple (no free-text) so it can be
-    evaluated in plain Python with zero ambiguity."""
+    """A single, structured, evaluable eligibility condition."""
     __tablename__ = "eligibility_rules"
 
     id = Column(Integer, primary_key=True)
@@ -156,8 +155,7 @@ class ProcessStep(Base):
 
 
 # ---------------------------------------------------------------------------
-# Lightweight chat memory, so multi-turn conversations ("what about for OBC?"
-# following an eligibility question) can resolve pronouns/context.
+# Chat Memory & Session Tracking
 # ---------------------------------------------------------------------------
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
@@ -165,14 +163,12 @@ class ChatSession(Base):
     id = Column(String(64), primary_key=True)   # client-generated session id (e.g. uuid4)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    # Conversational memory: lets follow-up questions ("what documents does
-    # it need?") resolve without repeating the scheme name every time, and
-    # lets a guided step-by-step walkthrough remember where the citizen is.
     last_scheme_slug = Column(String(300), nullable=True)
     guided_scheme_slug = Column(String(300), nullable=True)
     guided_process_step = Column(Integer, nullable=True)  # None = no active walkthrough
 
     messages = relationship("ChatMessage", back_populates="session", order_by="ChatMessage.id")
+    user_documents = relationship("UserDocument", back_populates="session")
 
 
 class ChatMessage(Base):
@@ -186,3 +182,40 @@ class ChatMessage(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     session = relationship("ChatSession", back_populates="messages")
+
+
+# ---------------------------------------------------------------------------
+# NEW: Document Upload & Intelligent Analysis Tables
+# ---------------------------------------------------------------------------
+class UserDocument(Base):
+    """Stores metadata and extracted text for citizen-uploaded documents (e.g., certificates, PDFs)."""
+    __tablename__ = "user_documents"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = Column(String(64), ForeignKey("chat_sessions.id"), nullable=True)
+    
+    filename = Column(String(255), nullable=False)
+    document_type = Column(String(50), nullable=True)       # e.g., 'CERTIFICATE', 'CIRCULAR', 'GO'
+    extracted_text = Column(Text, nullable=True)            # Full OCR/parsed text
+    
+    # AI-Generated Insights
+    summary = Column(Text, nullable=True)                   # Simple language explanation
+    metadata_json = Column(JSON, nullable=True)             # Extracted key entities (dates, issuer, etc.)
+    
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship("ChatSession", back_populates="user_documents")
+    chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
+
+
+class DocumentChunk(Base):
+    """Stores vectorized chunks of uploaded documents for localized RAG answering."""
+    __tablename__ = "document_chunks"
+
+    id = Column(Integer, primary_key=True)
+    document_id = Column(String(36), ForeignKey("user_documents.id"), nullable=False)
+    chunk_index = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)                     # 500-1000 character segment of the document
+    embedding = Column(Text, nullable=True)                 # JSON encoded float array for RAG search
+    
+    document = relationship("UserDocument", back_populates="chunks")

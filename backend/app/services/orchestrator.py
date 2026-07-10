@@ -1,20 +1,9 @@
 """
 Orchestrator: the glue between "what did the user ask" and "which
-deterministic handler answers it" - now with conversational memory, so it
-feels like talking to one continuous officer rather than re-explaining
-context every message.
+deterministic handler answers it".
 
-Four behaviors layered on top of the original intent routing, in priority
-order (checked before the generic classifier, since they're conversational
-patterns rather than one-off lookups):
-  1. Greetings - instant, no LLM.
-  2. "next"/"continue" during an active guided walkthrough.
-  3. Starting a guided step-by-step walkthrough ("walk me through X").
-  4. Scheme recommendation ("what am I eligible for?").
-  5. Plain-language explanation of legal/circular text.
-  6. Everything else - the original classify -> handler -> phrase flow,
-     now falling back to the session's last-discussed scheme when the
-     message doesn't name one explicitly.
+UPDATED: Contains an AI Semantic Gatekeeper to prevent context leakage,
+now with aggressive history-wiping on explicit topic shifts.
 """
 import re
 from typing import Optional, Dict, Any
@@ -26,7 +15,6 @@ from ..handlers import (
     circulars, scheme_detail, scheme_finder,
 )
 from . import llm_service, profile_extraction
-
 
 FULL_DETAIL_PATTERNS = re.compile(
     r"\b(everything|full detail|full details|all detail|all details|complete detail|complete information|"
@@ -73,9 +61,31 @@ GUIDE_NEXT_PATTERNS = re.compile(
 )
 
 
+def _is_context_dependent(message: str, last_slug: str) -> bool:
+    """
+    Semantic Intent Gatekeeper:
+    Prevents context contamination by asking the LLM if the new message 
+    is a continuation of the previous topic, or a completely new topic.
+    """
+    prompt = f"""You are a routing assistant. 
+Previous topic discussed: '{last_slug}'
+New User Message: "{message}"
+
+Does the new message directly refer to, or act as a follow-up to the previous topic?
+If the new message explicitly names a different scheme, asks about a completely different topic, or is a standalone question, answer "INDEPENDENT".
+If it relies on the previous topic to make sense (e.g. "what are the documents?", "am I eligible?", "how do I apply"), answer "DEPENDENT".
+
+Respond with exactly one word: DEPENDENT or INDEPENDENT."""
+    
+    result = llm_service.call_raw(prompt, max_tokens=10, temperature=0.0)
+    
+    # If the LLM explicitly determines a context shift, or fails safely
+    if result and "INDEPENDENT" in result.upper():
+        return False
+    return True
+
+
 def _extract_scheme_slug(db: Session, message: str) -> Optional[str]:
-    """Exact/substring match on scheme name from the message text only
-    (no session fallback here - that's handled by _resolve_scheme_slug)."""
     message_l = message.lower()
     schemes = db.query(models.Scheme).all()
     best = None
@@ -93,16 +103,21 @@ def _extract_all_scheme_slugs(db: Session, message: str) -> list[str]:
 
 
 def _resolve_scheme_slug(db: Session, message: str, session: Optional[models.ChatSession]) -> Optional[str]:
-    """Try to find a scheme named in THIS message; if none, fall back to
-    whatever scheme was last discussed in this session - this is what lets
-    'what documents does it need?' work without repeating the scheme name."""
+    # 1. Try to find explicit mention in current message
     slug = _extract_scheme_slug(db, message)
     if slug:
         if session is not None:
             session.last_scheme_slug = slug
         return slug
+        
+    # 2. Check if we should inherit the session context (Gatekeeper)
     if session is not None and session.last_scheme_slug:
-        return session.last_scheme_slug
+        if _is_context_dependent(message, session.last_scheme_slug):
+            return session.last_scheme_slug
+        else:
+            # Prevent Context Leakage by clearing the old topic
+            session.last_scheme_slug = None
+            
     return None
 
 
@@ -154,11 +169,13 @@ def handle_message(
 ) -> tuple[str, str, Optional[dict]]:
     """Returns (intent, reply_text, structured_data)."""
     stripped = message.strip()
+    
+    # Track the active topic BEFORE processing the new message
+    old_slug = session.last_scheme_slug if session else None
 
     if GREETING_PATTERNS.match(stripped):
         return "greeting", GREETING_REPLY, None
 
-    # Continuing an active guided walkthrough takes priority over everything else.
     if session is not None and session.guided_process_step is not None and GUIDE_NEXT_PATTERNS.match(stripped):
         data = _handle_guided_next(db, session)
         reply = llm_service.format_reply(message, "guided_step", data, history)
@@ -168,31 +185,31 @@ def handle_message(
         slug = _resolve_scheme_slug(db, message, session)
         if slug and session is not None:
             data = _handle_guided_start(db, session, slug)
+            
+            # Wipe history if the topic was explicitly changed
+            if old_slug and session.last_scheme_slug != old_slug and len(history) > 0:
+                history = []
+                
             reply = llm_service.format_reply(message, "guided_step", data, history)
             return "guided_step", reply, data
         return "guided_step", "Which scheme would you like me to walk you through?", None
 
     if RECOMMEND_PATTERNS.search(message) or SELF_DESCRIPTION_PATTERNS.search(message):
-        # Citizen-centric workflow: extract profile from free text -> identify
-        # category tags -> use them to narrow candidate schemes -> evaluate ->
-        # rank. Extraction never decides eligibility itself - it only narrows
-        # which schemes get checked by the deterministic rules engine.
         extracted = profile_extraction.extract_profile(message)
         citizen_categories = extracted.get("citizen_categories", [])
-
-        # Explicit profile fields from the frontend form take precedence over
-        # anything guessed from free text; extracted fields fill the gaps.
-        # citizen_categories is kept in the profile itself (not just used for
-        # candidate narrowing) so schemes can have a "contains" eligibility
-        # rule requiring a specific category tag.
-        merged_profile = {**extracted,
-                           **{k: v for k, v in (user_profile or {}).items() if v not in (None, "", False)}}
+        merged_profile = {**extracted, **{k: v for k, v in (user_profile or {}).items() if v not in (None, "", False)}}
 
         if not merged_profile or not any(v not in (None, "", False) for v in merged_profile.values()):
             data = {"error": "missing_profile", "required_fields": ["age", "annual_income", "category"],
                      "scheme_name": "a scheme recommendation"}
         else:
             data = scheme_finder.recommend_schemes(db, merged_profile, citizen_categories or None)
+            
+        if session:
+            session.last_scheme_slug = None # Clear context for future questions
+        if old_slug and len(history) > 0:
+            history = [] # Wipe history to prevent LLM confusion
+            
         reply = llm_service.format_reply(message, "recommend_schemes", data, history)
         return "recommend_schemes", reply, data
 
@@ -210,6 +227,10 @@ def handle_message(
                 circular_text = circulars.get_circular_text(db, found[0]["id"])
                 circular_label = found[0]["doc_number"]
         data = {"circular": circular_label, "circular_raw_text": circular_text} if circular_text else None
+        
+        if session and old_slug and session.last_scheme_slug != old_slug and len(history) > 0:
+            history = []
+            
         reply = llm_service.format_reply(message, "explain_legal", data, history)
         return "explain_legal", reply, data
 
@@ -260,6 +281,9 @@ def handle_message(
             data = scheme_compare.compare_schemes(db, slugs, user_profile)
         else:
             data = None
+        # Comparing clears the primary active topic
+        if session:
+            session.last_scheme_slug = None
 
     else:  # general_query
         slug = _resolve_scheme_slug(db, message, session)
@@ -272,6 +296,14 @@ def handle_message(
             full = scheme_detail.get_full_details(db, slug)
             if full:
                 data = full
+
+    # FINAL CHECK: Filter history strictly if we switched topics. 
+    # (Either the gatekeeper wiped it, or the user explicitly mentioned a NEW scheme)
+    if session and len(history) > 0:
+        new_slug = session.last_scheme_slug
+        if old_slug and new_slug != old_slug:
+            # We switched from one topic to a different one. Clear history so the LLM doesn't get confused!
+            history = [] 
 
     reply = llm_service.format_reply(message, intent, data, history)
     return intent, reply, data
