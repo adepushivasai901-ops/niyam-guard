@@ -324,6 +324,22 @@ def run():
     db.commit()
 
     db.close()
+
+    # Generate embeddings for semantic (RAG) search over circular text.
+    # Safe to skip - store_embedding() no-ops if no LLM key is configured.
+    from .config import LLM_ENABLED
+    if LLM_ENABLED:
+        from .services import embeddings
+        db2 = SessionLocal()
+        all_circulars = db2.query(models.Circular).all()
+        print(f"Generating embeddings for {len(all_circulars)} circulars (RAG search)...")
+        for c in all_circulars:
+            embeddings.store_embedding(db2, c)
+        db2.close()
+        print("✅ Embeddings generated.")
+    else:
+        print("ℹ️  No GOOGLE_API_KEY configured - skipping embeddings (semantic search will fall back to keyword search).")
+
     print("✅ Seed data loaded: 3 schemes, 5 circulars, versioned income-certificate scenario ready.")
 
 

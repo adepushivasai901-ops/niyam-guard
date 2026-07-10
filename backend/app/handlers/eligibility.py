@@ -36,16 +36,41 @@ def get_current_version(db: Session, scheme_slug: str) -> models.SchemeVersion |
     return None
 
 
-def evaluate_rule(rule: models.EligibilityRule, profile: Dict[str, Any]) -> bool:
+def evaluate_rule(rule: models.EligibilityRule, profile: Dict[str, Any]) -> tuple[bool, str]:
+    """Returns (passed, explanation). For failed numeric rules, the explanation
+    is enriched with the exact gap (e.g. 'exceeds the limit by Rs. 15,000') so
+    the citizen knows precisely what would need to change - not just that
+    something failed."""
     user_value = profile.get(rule.field_name)
     op_fn = OPERATORS.get(rule.operator)
     if op_fn is None:
-        # Unknown operator - fail safe rather than silently assume eligible.
-        return False
+        return False, rule.explanation  # unknown operator - fail safe
+
     try:
-        return bool(op_fn(user_value, rule.value))
+        passed = bool(op_fn(user_value, rule.value))
     except TypeError:
-        return False
+        return False, rule.explanation + " (value not provided)"
+
+    if passed:
+        return True, rule.explanation
+
+    # Build a precise gap description for numeric comparisons.
+    explanation = rule.explanation
+    if user_value is not None and isinstance(rule.value, (int, float)) and isinstance(user_value, (int, float)):
+        if rule.operator in ("<=", "<"):
+            gap = user_value - rule.value
+            if gap > 0:
+                explanation += f" - your provided value ({user_value:,.0f}) exceeds this by {gap:,.0f}"
+        elif rule.operator in (">=", ">"):
+            gap = rule.value - user_value
+            if gap > 0:
+                explanation += f" - your provided value ({user_value:,.0f}) is short of this by {gap:,.0f}"
+    elif rule.operator == "in" and user_value is not None:
+        explanation += f" - your provided value was '{user_value}', which is not in the allowed list"
+    elif user_value is None:
+        explanation += " - this could not be verified because the value was not provided"
+
+    return False, explanation
 
 
 def check_eligibility(db: Session, scheme_slug: str, profile: Dict[str, Any]) -> EligibilityResult | None:
@@ -55,10 +80,11 @@ def check_eligibility(db: Session, scheme_slug: str, profile: Dict[str, Any]) ->
 
     reasons_met, reasons_failed = [], []
     for rule in version.eligibility_rules:
-        if evaluate_rule(rule, profile):
-            reasons_met.append(rule.explanation)
+        passed, explanation = evaluate_rule(rule, profile)
+        if passed:
+            reasons_met.append(explanation)
         else:
-            reasons_failed.append(rule.explanation)
+            reasons_failed.append(explanation)
 
     return EligibilityResult(
         scheme_name=version.scheme.name,

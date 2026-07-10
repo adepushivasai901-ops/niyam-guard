@@ -1,5 +1,5 @@
 """
-LLM service.
+LLM service (local Ollama).
 
 IMPORTANT: the LLM is used for two things only, both "downstream" of the
 structured facts:
@@ -12,25 +12,44 @@ steps, or numbers - those always come from Postgres/SQLite via the handlers.
 This keeps answers consistent and auditable, which matters a lot for a
 government compliance tool.
 
-If no ANTHROPIC_API_KEY is set, everything degrades gracefully to simple
-keyword-matching + template formatting, so the project still runs end to end
-for a demo without any key configured.
+Ollama runs locally (http://localhost:11434 by default), so there is no API
+key to expire or rate-limit. If the Ollama service isn't running, or a call
+fails for any reason, everything degrades gracefully to keyword-matching +
+template formatting, so the project still runs end to end without it.
 """
 import json
+import requests
 from typing import Optional
 from .. import config
 
-_client = None
-if config.LLM_ENABLED:
+
+def _call_ollama(prompt: str, system: Optional[str] = None, max_tokens: int = 1000, temperature: float = 0.3) -> Optional[str]:
+    """Low-level call to the local Ollama server. Returns None on any
+    failure (server not running, model not pulled, timeout, etc.) so
+    callers can fall back cleanly instead of crashing."""
+    if not config.LLM_ENABLED:
+        return None
     try:
-        import anthropic
-        _client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
+        resp = requests.post(
+            f"{config.OLLAMA_HOST}/api/generate",
+            json={
+                "model": config.OLLAMA_MODEL,
+                "prompt": full_prompt,
+                "stream": False,
+                "options": {"temperature": temperature, "num_predict": max_tokens},
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        text = resp.json().get("response", "").strip()
+        return text or None
+    except requests.exceptions.ConnectionError:
+        print("[niyamguard] Could not reach Ollama - is it running? (falling back to templates)")
+        return None
     except Exception as e:
-        # Never let an LLM client setup problem (bad key, version mismatch,
-        # missing package, etc.) prevent the whole server from starting.
-        # The app falls back to keyword classification + template replies.
-        print(f"[niyamguard] LLM client unavailable, falling back to templates: {e}")
-        _client = None
+        print(f"[niyamguard] Ollama call failed, falling back to templates: {e}")
+        return None
 
 
 SYSTEM_PROMPT = """You are NiyamGuard AI, an official government policy compliance and citizen assistance
@@ -40,15 +59,23 @@ clear, precise, respectful, and neutral - never casual, never speculative.
 STRICT RULES:
 - You may ONLY use facts given to you in the "STRUCTURED DATA" block below. Never invent
   eligibility criteria, documents, numbers, dates, or steps that are not present in it.
+- COMPLETENESS IS MANDATORY: if a field, document, step, or rule exists anywhere in the
+  STRUCTURED DATA, it MUST appear in your answer. Do not summarize away or skip items to
+  keep the answer short - a citizen relying on this answer needs every detail that is
+  present, not a shortened preview. Use bullet points or numbered lists to keep a long,
+  complete answer readable.
 - If the structured data says a scheme/document/circular was not found, say so plainly and
   do not guess an answer.
 - Always cite the circular/GO number when referencing a rule, if one is present in the data.
 - When asked to compare old vs new rules, clearly separate "Earlier position" and
   "Current position", referencing the circular numbers and effective dates.
 - When asked about eligibility, always explain WHY (or why not) using the reasons_met /
-  reasons_failed provided - do not restate them mechanically, but do not omit any reason either.
+  reasons_failed provided, including any stated numeric gap - do not restate them
+  mechanically, but do not omit any reason either.
 - When listing documents, separate Mandatory and Secondary/Supporting clearly, and state the
-  number of copies required for each.
+  number of copies required for each and any notes present.
+- If structured data has a "required_fields" list (missing profile info), ask for exactly
+  those fields by name - do not ask vaguely for "more information".
 - Keep tone formal and helpful, similar to how a knowledgeable government helpdesk officer
   would explain a rule to a citizen.
 """
@@ -56,14 +83,11 @@ STRICT RULES:
 
 def classify_intent(message: str) -> str:
     """Classify a user message into one of the supported intents.
-    Falls back to keyword heuristics if no LLM is configured."""
+    Falls back to keyword heuristics if Ollama is unavailable."""
     intents = [
         "fetch_document", "compare_versions", "check_eligibility",
         "list_documents", "get_process", "compare_schemes", "general_query",
     ]
-
-    if _client is None:
-        return _keyword_fallback_intent(message)
 
     prompt = f"""Classify the user's message into exactly ONE of these intents:
 - fetch_document: user wants to see/read a circular, GO, or document itself
@@ -78,18 +102,12 @@ Respond with ONLY the intent string, nothing else.
 
 User message: "{message}" """
 
-    try:
-        resp = _client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=20,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = resp.content[0].text.strip().lower()
+    text = _call_ollama(prompt, max_tokens=20, temperature=0)
+    if text:
+        text_l = text.lower()
         for intent in intents:
-            if intent in text:
+            if intent in text_l:
                 return intent
-    except Exception:
-        pass
 
     return _keyword_fallback_intent(message)
 
@@ -113,9 +131,6 @@ def _keyword_fallback_intent(message: str) -> str:
 
 def format_reply(user_message: str, intent: str, structured_data: Optional[dict], history: Optional[list] = None) -> str:
     """Turn structured handler output into a professional natural-language reply."""
-    if _client is None:
-        return _template_fallback_reply(intent, structured_data)
-
     history = history or []
     history_text = "\n".join(f"{h['role']}: {h['content']}" for h in history[-6:])
 
@@ -128,27 +143,68 @@ Classified intent: {intent}
 STRUCTURED DATA (this is the ONLY source of facts you may use):
 {json.dumps(structured_data, indent=2, default=str) if structured_data is not None else "null - nothing was found in the knowledge base for this request."}
 
-Write the assistant's reply now, following all rules in your system prompt."""
+Write the assistant's reply now, following all rules above."""
 
-    try:
-        resp = _client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.content[0].text.strip()
-    except Exception as e:
-        return _template_fallback_reply(intent, structured_data) + f"\n\n(Note: LLM formatting unavailable - {e})"
+    text = _call_ollama(prompt, system=SYSTEM_PROMPT, max_tokens=1500, temperature=0.3)
+    if text:
+        return text
+    return _template_fallback_reply(intent, structured_data)
 
 
 # ---------------------------------------------------------------------------
-# Template fallback formatter - used if no API key is set. Keeps the project
-# fully runnable/demoable with zero external dependencies.
+# Template fallback formatter - used if Ollama is unreachable. Keeps the
+# project fully runnable/demoable with zero external dependencies.
 # ---------------------------------------------------------------------------
 def _template_fallback_reply(intent: str, data: Optional[dict]) -> str:
     if data is None:
         return "I could not find verified information on this in the knowledge base. Could you rephrase or specify the scheme/circular name?"
+
+    if isinstance(data, dict) and data.get("error") == "missing_profile":
+        return (f"To check eligibility for {data.get('scheme_name')} precisely, please provide: "
+                f"{', '.join(data.get('required_fields', []))}.")
+
+    # Full scheme detail (from scheme_detail.get_full_details) - has a
+    # distinctive "key_figures" key that no other handler output has.
+    if isinstance(data, dict) and "key_figures" in data:
+        lines = [f"{data['scheme_name']} ({data.get('category', 'scheme')}) - {data.get('department', '')}"]
+        if data.get("description"):
+            lines.append(data["description"])
+        lines.append(f"Governing circular: {data['governing_circular']} - {data.get('circular_title','')} "
+                      f"(effective {data['effective_date']})")
+
+        kf = data.get("key_figures", {})
+        fig_lines = [f"{k.replace('_',' ').title()}: {v}" for k, v in kf.items() if v is not None]
+        if fig_lines:
+            lines.append("Key figures: " + "; ".join(fig_lines))
+
+        if data.get("eligibility_rules"):
+            lines.append("Eligibility criteria:")
+            for r in data["eligibility_rules"]:
+                lines.append(f"  - {r['explanation']}")
+
+        docs = data.get("documents") or {}
+        if docs.get("mandatory_documents"):
+            lines.append("Mandatory documents:")
+            for d in docs["mandatory_documents"]:
+                lines.append(f"  - {d['name']} ({d['copies_required']} copy/copies)" + (f" - {d['notes']}" if d.get("notes") else ""))
+        if docs.get("secondary_documents"):
+            lines.append("Secondary/Supporting documents:")
+            for d in docs["secondary_documents"]:
+                lines.append(f"  - {d['name']} ({d['copies_required']} copy/copies)" + (f" - {d['notes']}" if d.get("notes") else ""))
+
+        proc = data.get("process") or {}
+        if proc.get("steps"):
+            lines.append("Process:")
+            for s in proc["steps"]:
+                lines.append(f"  Step {s['step_number']}: {s['title']} - {s['description']}")
+
+        rc = data.get("recent_change") or {}
+        if rc.get("has_previous_version"):
+            lines.append(f"Recent change: under {rc['old_circular']} it was different; "
+                          f"as of {rc['new_circular']} (effective {rc['new_effective_date']}), "
+                          + "; ".join(f"{c['field']} changed from {c['old_value']} to {c['new_value']}" for c in rc.get("changes", [])))
+
+        return "\n".join(lines)
 
     if intent == "fetch_document":
         if isinstance(data, list):

@@ -62,8 +62,8 @@
 
 <div id="profile-bar">
   <span>Your profile (used only for eligibility checks):</span>
-  <input type="number" id="p-age" placeholder="Age" />
-  <input type="number" id="p-income" placeholder="Annual income" />
+  <input type="number" id="p-age" placeholder="Age" min="0" max="120" />
+  <input type="number" id="p-income" placeholder="Annual income" min="0" />
   <select id="p-category">
     <option value="">Category</option>
     <option>SC</option><option>ST</option><option>OBC</option><option>General-EWS</option><option>General</option>
@@ -112,8 +112,8 @@ function getProfile() {
   const category = document.getElementById('p-category').value;
   const enrolled = document.getElementById('p-enrolled').checked;
   const profile = {};
-  if (age) profile.age = parseInt(age);
-  if (income) profile.annual_income = parseFloat(income);
+  if (age) profile.age = Math.max(0, parseInt(age));
+  if (income) profile.annual_income = Math.max(0, parseFloat(income));
   if (category) profile.category = category;
   profile.currently_enrolled = enrolled;
   return profile;

@@ -9,8 +9,26 @@ from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..handlers import eligibility, documents, process, comparison, scheme_compare, circulars
+from ..handlers import eligibility, documents, process, comparison, scheme_compare, circulars, scheme_detail
 from . import llm_service
+
+
+FULL_DETAIL_PATTERNS = re.compile(
+    r"\b(everything|full detail|full details|all detail|all details|complete detail|complete information|"
+    r"tell me about|give me details|full information|entire information)\b",
+    re.I,
+)
+
+GREETING_PATTERNS = re.compile(
+    r"^\s*(hi|hello|hey|namaste|good morning|good afternoon|good evening|thanks|thank you|bye|goodbye)\b\s*[!.,]*\s*$",
+    re.I,
+)
+
+GREETING_REPLY = (
+    "Namaste. I am the NiyamGuard AI citizen assistant. I can share circulars, check scheme "
+    "eligibility, list required documents, explain application processes, and compare schemes - "
+    "all from verified government records. How may I help you today?"
+)
 
 
 def _extract_scheme_slug(db: Session, message: str) -> Optional[str]:
@@ -32,11 +50,28 @@ def _extract_all_scheme_slugs(db: Session, message: str) -> list[str]:
     return [s.slug for s in schemes if s.name.lower() in message_l or s.slug.replace("-", " ") in message_l]
 
 
+def _missing_profile_message(db: Session, slug: str) -> Dict[str, Any]:
+    """Instead of a generic 'need more info' error, name exactly which fields
+    this specific scheme's eligibility rules require."""
+    version = eligibility.get_current_version(db, slug)
+    required_fields = sorted({r.field_name for r in version.eligibility_rules}) if version else []
+    return {
+        "error": "missing_profile",
+        "scheme_name": version.scheme.name if version else slug,
+        "required_fields": required_fields,
+        "message": f"To check eligibility precisely, please provide: {', '.join(required_fields)}.",
+    }
+
+
 def handle_message(db: Session, message: str, user_profile: Optional[Dict[str, Any]], history: list) -> tuple[str, str, Optional[dict]]:
     """Returns (intent, reply_text, structured_data)."""
+    if GREETING_PATTERNS.match(message.strip()):
+        return "greeting", GREETING_REPLY, None
+
     intent = llm_service.classify_intent(message)
 
     data: Optional[Dict[str, Any]] = None
+    wants_full_detail = bool(FULL_DETAIL_PATTERNS.search(message))
 
     if intent == "fetch_document":
         # Prefer matching a known scheme name first (reliable), then fall
@@ -60,8 +95,8 @@ def handle_message(db: Session, message: str, user_profile: Optional[Dict[str, A
         slug = _extract_scheme_slug(db, message)
         if not slug:
             data = None
-        elif not user_profile:
-            data = {"error": "missing_profile", "message": "need age/income/category to evaluate eligibility"}
+        elif not user_profile or not any(v not in (None, "", False) for v in user_profile.values()):
+            data = _missing_profile_message(db, slug)
         else:
             result = eligibility.check_eligibility(db, slug, user_profile)
             data = result.dict() if result else None
@@ -88,14 +123,21 @@ def handle_message(db: Session, message: str, user_profile: Optional[Dict[str, A
     else:  # general_query
         slug = _extract_scheme_slug(db, message)
         if slug:
-            version = eligibility.get_current_version(db, slug)
-            if version:
-                data = {
-                    "scheme_name": version.scheme.name,
-                    "description": version.scheme.short_description,
-                    "circular": version.circular.doc_number,
-                    "effective_date": version.circular.effective_date.strftime("%d-%b-%Y"),
-                }
+            # Broad questions ("tell me about X", "full details of X") get
+            # everything we know about the scheme in one shot, instead of
+            # just the name/description - this is the fix for shallow answers.
+            data = scheme_detail.get_full_details(db, slug)
+
+    # If the phrasing clearly signals "give me everything", override to the
+    # full aggregator regardless of which narrower intent got classified -
+    # e.g. "what documents are needed, tell me everything about scholarship"
+    # should not stop at just the document list.
+    if wants_full_detail:
+        slug = _extract_scheme_slug(db, message)
+        if slug:
+            full = scheme_detail.get_full_details(db, slug)
+            if full:
+                data = full
 
     reply = llm_service.format_reply(message, intent, data, history)
     return intent, reply, data

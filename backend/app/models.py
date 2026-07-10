@@ -48,6 +48,7 @@ class Circular(Base):
     supersedes_circular_id = Column(Integer, ForeignKey("circulars.id"), nullable=True)
     extraction_confidence = Column(Float, default=1.0)     # 0-1, set during ingestion
     needs_human_review = Column(Boolean, default=False)     # low-confidence extractions get routed here
+    embedding = Column(Text, nullable=True)                 # JSON-encoded vector, for semantic (RAG) search
 
     department = relationship("Department")
 
